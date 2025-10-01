@@ -1,0 +1,195 @@
+const express = require('express');
+const puppeteer = require('puppeteer');
+const helmet = require('helmet');
+const cors = require('cors');
+const compression = require('compression');
+const morgan = require('morgan');
+const NodeCache = require('node-cache');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const TARGET_URL = process.env.TARGET_URL || 'https://learn.cloudsecnetwork.com';
+
+// Cache configuration
+const cache = new NodeCache({ 
+  stdTTL: 2592000, // 30 days cache (static content)
+  checkperiod: 86400, // Check for expired keys every 24 hours
+  useClones: false, // Better performance for large HTML content
+  deleteOnExpire: true, // Automatically delete expired keys
+  maxKeys: 1000 // Limit cache size to prevent memory issues
+});
+
+
+// Middleware
+app.use(helmet({
+  contentSecurityPolicy: false, // Disable CSP for prerendered content
+  crossOriginEmbedderPolicy: false
+}));
+app.use(cors());
+app.use(compression());
+app.use(morgan('combined'));
+app.use(express.json());
+
+// Browser instance management
+let browser = null;
+
+const initBrowser = async () => {
+  if (!browser) {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--disable-web-security',
+        '--disable-features=VizDisplayCompositor'
+      ]
+    });
+  }
+  return browser;
+};
+
+const prerenderPage = async (url) => {
+  const browser = await initBrowser();
+  const page = await browser.newPage();
+  
+  try {
+    // Set viewport and user agent
+    await page.setViewport({ width: 1920, height: 1080 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    
+    // Navigate to the target URL
+    await page.goto(url, { 
+      waitUntil: 'networkidle2',
+      timeout: 30000 
+    });
+    
+    // Wait for React to render
+    await page.waitForTimeout(2000);
+    
+    // Wait for any dynamic content to load
+    try {
+      await page.waitForSelector('body', { timeout: 5000 });
+    } catch (e) {
+      console.warn('Body selector not found, continuing...');
+    }
+    
+    // Get the full HTML content
+    const html = await page.content();
+    
+    return html;
+  } finally {
+    await page.close();
+  }
+};
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'healthy', 
+    timestamp: new Date().toISOString(),
+    targetUrl: TARGET_URL
+  });
+});
+
+// Main prerender endpoint
+app.get('*', async (req, res) => {
+  try {
+    const requestPath = req.path;
+    
+    // Determine target domain from Host header (sent by ALB)
+    const hostHeader = req.get('Host');
+    const targetDomain = hostHeader || TARGET_URL;
+    const fullUrl = `${targetDomain}${requestPath}`;
+    
+    // Check cache first (include domain in cache key to separate domains)
+    const cacheKey = `prerender:${hostHeader}:${requestPath}`;
+    const cachedHtml = cache.get(cacheKey);
+    
+    if (cachedHtml) {
+      console.log(`Cache hit for: ${hostHeader}${requestPath}`);
+      res.set('X-Cache', 'HIT');
+      res.set('X-Cache-Key', cacheKey);
+      res.set('X-Cache-TTL', '2592000');
+      res.set('Cache-Control', 'public, max-age=2592000'); // 30 days
+      res.set('X-Prerender-Service', 'CSN-Prerender-v1.0');
+      res.set('X-Target-Domain', hostHeader);
+      return res.send(cachedHtml);
+    }
+    
+    console.log(`Prerendering: ${fullUrl} (from Host: ${hostHeader})`);
+    
+    // Prerender the page
+    const html = await prerenderPage(fullUrl);
+    
+    // Cache the result
+    cache.set(cacheKey, html);
+    console.log(`Cached prerendered content for: ${hostHeader}${requestPath}`);
+    
+    // Set cache headers
+    res.set('X-Cache', 'MISS');
+    res.set('X-Cache-Key', cacheKey);
+    res.set('X-Cache-TTL', '2592000');
+    res.set('X-Cache-Expires', new Date(Date.now() + 2592000000).toISOString());
+    res.set('Cache-Control', 'public, max-age=2592000'); // 30 days
+    res.set('X-Prerender-Service', 'CSN-Prerender-v1.0');
+    res.set('X-Prerender-Timestamp', new Date().toISOString());
+    res.set('X-Target-Domain', hostHeader);
+    
+    res.send(html);
+    
+  } catch (error) {
+    console.error('Prerender error:', error);
+    
+    // Fallback: try to serve the original page
+    try {
+      const fallbackUrl = hostHeader || TARGET_URL;
+      const fallbackHtml = await prerenderPage(fallbackUrl);
+      res.status(200).send(fallbackHtml);
+    } catch (fallbackError) {
+      console.error('Fallback error:', fallbackError);
+      res.status(500).json({
+        error: 'Prerender service unavailable',
+        message: error.message,
+        timestamp: new Date().toISOString()
+      });
+    }
+  }
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  if (browser) {
+    await browser.close();
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('SIGINT received, shutting down gracefully');
+  if (browser) {
+    await browser.close();
+  }
+  process.exit(0);
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`CSN Prerender Service running on port ${PORT}`);
+  console.log(`Default Target URL: ${TARGET_URL}`);
+  console.log(`Multi-Domain Mode: Enabled (uses Host header from ALB)`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`Cache Configuration:`);
+  console.log(`  - TTL: 2592000s (30 days)`);
+  console.log(`  - Check Period: 86400s (24 hours)`);
+  console.log(`  - Max Keys: 1000`);
+  console.log(`  - Auto Delete: true`);
+  console.log(`  - Domain-Separated Cache: Yes`);
+});
+
+module.exports = app;
